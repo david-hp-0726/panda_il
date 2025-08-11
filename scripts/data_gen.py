@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-data_gen.py — Panda + MoveIt expert rollout generator (Behavior Cloning)
-Author: you :)
-Run:
-  rosrun il_panda_bc data_gen.py --episodes 500 --dt 0.05
-
-Outputs:
-  ~/il_panda_bc/datasets/<timestamp>/
-    - rollouts.npz  (obs, acts, dones, episode_starts)
-    - stats.json    (feature mean/std and config)
+High-level Logic
+1. randomize three box obstacles
+2. sample a random valid start and goal pose
+3. use IK to turn those poses into joint states
+4. plan from start joint states to goal states
+5. resample the plan (interpolate waypoints to obtain joint positions at uniform timesteps) 
+6. compute actions and build observations (joint states, goal position, obstacle features)
 """
 import os
 import sys
@@ -26,7 +24,7 @@ import moveit_commander
 from geometry_msgs.msg import PoseStamped
 from moveit_commander import MoveGroupCommander, RobotCommander, PlanningSceneInterface
 from moveit_msgs.msg import RobotState
-from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest, GetPositionFK, GetPositionFKRequest
+from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest, GetPositionFK, GetPositionFKRequest, GetStateValidity, GetStateValidityRequest
 from sensor_msgs.msg import JointState
 
 # -----------------------------
@@ -132,6 +130,7 @@ def finite_diff(Q: np.ndarray, dt: float) -> np.ndarray:
     dq = (Q[1:] - Q[:-1]) / dt
     return dq
 
+
 # -----------------------------
 # Core generator class
 # -----------------------------
@@ -155,8 +154,10 @@ class PandaILDataGen:
 
         rospy.wait_for_service('/compute_ik')
         rospy.wait_for_service('/compute_fk')
+        rospy.wait_for_service('/check_state_validity')
         self.ik_srv = rospy.ServiceProxy('/compute_ik', GetPositionIK)
         self.fk_srv = rospy.ServiceProxy('/compute_fk', GetPositionFK)
+        self.state_valid_srv = rospy.ServiceProxy('/check_state_validity', GetStateValidity)
 
         # Buffers
         self.obs_buf = []
@@ -219,15 +220,18 @@ class PandaILDataGen:
         req.ik_request.pose_stamped = target_pose
         req.ik_request.ik_link_name = EEF_LINK
         req.ik_request.timeout = rospy.Duration(0.5)
-        # Seed with current state
         req.ik_request.robot_state = self.robot.get_current_state()
+
         try:
             res = self.ik_srv(req)
             if res.error_code.val > 0:
-                q = np.array(res.solution.joint_state.position, dtype=np.float64)
-                # Map to active joints order
-                name_to_pos = dict(zip(res.solution.joint_state.name, q))
+                q_all = np.array(res.solution.joint_state.position, dtype=np.float64)
+                name_to_pos = dict(zip(res.solution.joint_state.name, q_all))
                 q_out = np.array([name_to_pos[nm] for nm in self.joint_names], dtype=np.float64)
+
+                # Belt & suspenders: verify returned IK state is valid in scene
+                if not self.is_state_valid(q_out):
+                    return False, None
                 return True, q_out
             else:
                 return False, None
@@ -262,14 +266,33 @@ class PandaILDataGen:
 
     # -------- Planning --------
     def plan_from_to(self, q_start: np.ndarray, q_goal: np.ndarray):
-        # Set start state
-        start_state = msg_robot_state_from_q(self.joint_names, q_start)
-        self.group.set_start_state(start_state)
-        self.group.set_joint_value_target(q_goal.tolist())
-        success, plan, _, _ = self.group.plan()
-        if not success or len(plan.joint_trajectory.points) < 2:
+        # Validate endpoints first
+        if not self.is_state_valid(q_start):
             return None
+        if not self.is_state_valid(q_goal):
+            return None
+        rospy.loginfo("Collision check passed for the start and end poses")
+
+        self.group.set_start_state(msg_robot_state_from_q(self.joint_names, q_start))
+        self.group.set_joint_value_target(q_goal.tolist())
+
+        res = self.group.plan()
+        if isinstance(res, tuple):
+            success, plan = res[0], res[1]
+        else:
+            # Older MoveIt returns RobotTrajectory directly
+            success, plan = True, res
+
+        if (not success) or (plan is None) or (len(plan.joint_trajectory.points) < 2):
+            return None
+
+        # Dense collision check of the entire path
+        if not self.trajectory_is_collision_free(plan, joint_step=0.05):
+            return None
+
+        rospy.loginfo("Collision check passed for the entire path")
         return plan
+
 
     # -------- Episode --------
     def run_episode(self, dt_step: float) -> bool:
@@ -280,33 +303,44 @@ class PandaILDataGen:
         self.randomize_three_boxes()
 
         # 2) Sample a valid start & goal via IK on random poses
-        # Try a few times for start
         for _ in range(MAX_GOAL_RETRIES):
             start_pose = sample_pose_in_aabb()
-            ok, q_start = self.compute_ik(start_pose)
-            if ok: break
+            sp = np.array([start_pose.pose.position.x, start_pose.pose.position.y, start_pose.pose.position.z])
+            if self.point_in_any_box(sp):
+                continue
+            ok, q_start = self.compute_ik(start_pose)  # seed=None -> current state
+            if ok and self.is_state_valid(q_start):
+                break
         else:
+            rospy.logwarn("Failed to find valid start pose")
             return False
 
-        # Goal must be sufficiently separated
+        # 3) Sample a valid goal sufficiently far and not inside any box.
         for _ in range(MAX_GOAL_RETRIES):
             goal_pose = sample_pose_in_aabb()
+            gp = np.array([goal_pose.pose.position.x, goal_pose.pose.position.y, goal_pose.pose.position.z])
+            if self.point_in_any_box(gp):
+                continue
             if pose_distance(start_pose, goal_pose) < MIN_EE_DIST:
                 continue
+            # Seed goal IK with q_start for smoother, more solvable targets
             ok, q_goal = self.compute_ik(goal_pose)
-            if ok: break
+            if ok and self.is_state_valid(q_goal):
+                break
         else:
+            rospy.logwarn("Failed to find valid goal pose")
             return False
 
         # 3) Plan expert trajectory
         plan = self.plan_from_to(q_start, q_goal)
         if plan is None:
-            return 
+            rospy.logwarn("Failed to compute valid plan")
+            return False
         
-        traj_dur = plan.joint_trajectory.points[-1].time_from_start.to_sec()
-        rospy.sleep(traj_dur + 1)
+        # traj_dur = plan.joint_trajectory.points[-1].time_from_start.to_sec()
+        # rospy.sleep(traj_dur + 1)
 
-        ### Sanity check
+        ##### Sanity check
         jt = plan.joint_trajectory
         last_q = np.array(jt.points[-1].positions, dtype=np.float64)
 
@@ -324,8 +358,8 @@ class PandaILDataGen:
         dq = max(min(dq, 1.0), -1.0)
         ang_err = 2.0 * math.acos(dq)
 
-        rospy.logwarn(f"EE position error: {pos_err*1000:.2f} mm, orientation error: {ang_err*180/math.pi:.2f} deg")
-        ###
+        rospy.loginfo(f"EE position error: {pos_err*1000:.2f} mm, orientation error: {ang_err*180/math.pi:.2f} deg")
+        #####
 
         # Extract joint trajectory
         jt = plan.joint_trajectory
@@ -335,6 +369,7 @@ class PandaILDataGen:
         # 4) Resample to uniform dt, compute actions Δq
         Qu, tgrid = resample_trajectory(times, Q, dt_step)  # [T+1,7]
         if Qu.shape[0] < 2:
+            rospy.logwarn("After resampling the trajectory doesn't even have 2 timesteps - it's too short to learn from")
             return False
         A = Qu[1:] - Qu[:-1]        # [T,7]
         Qaligned = Qu[:-1]          # [T,7]
@@ -412,6 +447,54 @@ class PandaILDataGen:
             json.dump(meta, f, indent=2)
         rospy.loginfo(f"Saved dataset to {self.out_npz} and stats to {self.out_stats}")
 
+    # -------- Validity helpers --------
+    def point_in_any_box(self, p_xyz: np.ndarray) -> bool:
+        """
+        Checks if a point p_xyz [3] lies inside any of the 3 boxes defined in self.box_params
+        which stores [cx,cy,cz, sx,sy,sz]*3 where s* are full edge lengths.
+        """
+        if self.box_params is None:
+            return False
+        bp = self.box_params.reshape(3, 6)
+        for (cx, cy, cz, sx, sy, sz) in bp:
+            hx, hy, hz = sx * 0.5, sy * 0.5, sz * 0.5
+            if (abs(p_xyz[0] - cx) <= hx and
+                abs(p_xyz[1] - cy) <= hy and
+                abs(p_xyz[2] - cz) <= hz):
+                return True
+        return False
+
+    def is_state_valid(self, q: np.ndarray) -> bool:
+        req = GetStateValidityRequest()
+        req.group_name = ARM_GROUP
+        req.robot_state = msg_robot_state_from_q(self.joint_names, q)
+        try:
+            res = self.state_valid_srv(req)
+            return bool(res.valid)
+        except Exception as e:
+            rospy.logwarn(f"State validity service exception: {e}")
+            return False
+
+    def trajectory_is_collision_free(self, plan, joint_step: float = 0.05) -> bool:
+        """
+        Densely checks the planned joint path for collisions by interpolating between
+        successive waypoints with a maximum joint-space step of ~joint_step (radians).
+        """
+        if plan is None or len(plan.joint_trajectory.points) < 2:
+            return False
+        pts = plan.joint_trajectory.points
+        for i in range(len(pts) - 1):
+            qa = np.array(pts[i].positions, dtype=np.float64)
+            qb = np.array(pts[i+1].positions, dtype=np.float64)
+            seg_len = np.linalg.norm(qb - qa)
+            n_steps = max(1, int(np.ceil(seg_len / joint_step)))
+            for s in range(n_steps + 1):
+                alpha = s / float(n_steps)
+                q = qa * (1.0 - alpha) + qb * alpha
+                if not self.is_state_valid(q):
+                    return False
+        return True
+    
 # -----------------------------
 # Main
 # -----------------------------
@@ -442,6 +525,7 @@ def main():
                 rospy.loginfo(f"Collected {successes}/{target} episodes...")
         else:
             # soft retry; adjust workspace/obstacles if too many fails
+            rospy.logwarn("Skipping episode")
             pass
 
         time.sleep(2)
