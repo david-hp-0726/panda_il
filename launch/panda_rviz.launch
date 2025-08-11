@@ -1,0 +1,11 @@
+<launch>
+  <!-- =========================================
+       Bring up Panda’s MoveIt demo environment
+       =========================================
+       This INCLUDE pulls another launch file.
+       The '$(find panda_moveit_config)' part asks
+       ROS to resolve the *package path* and then
+       we point to its 'launch/demo.launch'.
+  -->
+  <include file="$(find panda_moveit_config)/launch/demo.launch" />
+</launch>
