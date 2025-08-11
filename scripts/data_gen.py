@@ -103,8 +103,8 @@ class PandaILDataGen:
         self.box_params = None
 
         # Output paths
-        ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        base_dir = os.path.expanduser("~/ws_il/src/panda_il/datasets/" + ts)
+        # ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        base_dir = os.path.expanduser("~/ws_il/src/panda_il/datasets/")
         ensure_dir(base_dir)
         self.out_npz = os.path.join(base_dir, "rollouts.npz")
         self.out_stats = os.path.join(base_dir, "stats.json")
@@ -205,8 +205,6 @@ class PandaILDataGen:
             return None
         if not self.is_state_valid(q_goal):
             return None
-        rospy.loginfo("Collision check passed for the start and end poses")
-
         self.group.set_start_state(msg_robot_state_from_q(self.joint_names, q_start))
         self.group.set_joint_value_target(q_goal.tolist())
 
@@ -299,7 +297,7 @@ class PandaILDataGen:
         jt = plan.joint_trajectory
         times = [pt.time_from_start.to_sec() for pt in jt.points]
         Q = np.array([pt.positions for pt in jt.points], dtype=np.float64)  # [N, 7]
-
+        
         # 4) Resample to uniform dt, compute actions Δq
         Qu, tgrid = resample_trajectory(times, Q, dt_step)  # [T+1,7]
         if Qu.shape[0] < 2:
