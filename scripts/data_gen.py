@@ -116,11 +116,6 @@ class PandaILDataGen:
         Place 3 boxes such that none contains any point in forbid_points (each [3], in BASE_LINK).
         margin inflates each half-extent by margin.
         """
-        # Remove old
-        for i in range(3):
-            self.scene.remove_world_object(f"box_{i}")
-        rospy.sleep(0.2)
-
         params = []
         placed = 0
         for i in range(3):

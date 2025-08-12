@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json, sys, time
+import json, sys, time, math
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -198,7 +198,8 @@ class BCController:
             q_err = quat_error(gquat, ee_quat)       # [4]
             obb = self.box_params                    # [18]
 
-            obs_row = np.concatenate([q, qdot, ee_pos_err, q_err, obb], axis=0)  # [39]
+            # [ q (7), qdot (7), (gpos - ee_pos) (3), quat_error(gquat, ee_quat) (4), boxes (18) ] = [39]
+            obs_row = np.concatenate([q, qdot, ee_pos_err, q_err, obb], axis=0)  
             dq = self.policy_step(obs_row)
             q_target = q + dq
 
