@@ -16,7 +16,7 @@ import time
 import math
 import argparse
 import datetime as dt
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import rospy
@@ -121,40 +121,62 @@ class PandaILDataGen:
         rospy.loginfo(f"Saving to: {base_dir}")
 
     # -------- Obstacles --------
-    def randomize_three_boxes(self):
+    def remove_three_boxes(self):
+        for i in range(3):
+            self.scene.remove_world_object(f"box_{i}")
+        rospy.sleep(0.2)
+
+    def randomize_three_boxes_avoiding(self, forbid_points: List[np.ndarray], margin: float = 0.02, max_tries: int = 200):
+        """
+        Place 3 boxes such that none contains any point in forbid_points (each [3], in BASE_LINK).
+        margin inflates each half-extent by margin.
+        """
         # Remove old
         for i in range(3):
             self.scene.remove_world_object(f"box_{i}")
         rospy.sleep(0.2)
 
         params = []
+        placed = 0
         for i in range(3):
             name = f"box_{i}"
-            pose = PoseStamped()
-            pose.header.frame_id = BASE_LINK
-            pose.pose.position.x = rnd(*WS_AABB["x"])
-            pose.pose.position.y = rnd(*WS_AABB["y"])
-            pose.pose.position.z = rnd(*WS_AABB["z"])
-            pose.pose.orientation.w = 1.0
-            size = (
-                rnd(*BOX_EDGE_RANGE),
-                rnd(*BOX_EDGE_RANGE),
-                rnd(*BOX_EDGE_RANGE),
-            )
-            self.scene.add_box(name, pose, size)
-            params.extend([pose.pose.position.x, pose.pose.position.y, pose.pose.position.z,
-                           size[0], size[1], size[2]])
-        rospy.sleep(0.5)  # ensure update
+            ok = False
+            for _ in range(max_tries):
+                cx = rnd(*WS_AABB["x"]); cy = rnd(*WS_AABB["y"]); cz = rnd(*WS_AABB["z"])
+                sx = rnd(*BOX_EDGE_RANGE); sy = rnd(*BOX_EDGE_RANGE); sz = rnd(*BOX_EDGE_RANGE)
+
+                # reject if any forbid point would be inside this candidate box
+                if any(self.point_in_candidate_box(p, cx, cy, cz, sx, sy, sz, margin) for p in forbid_points):
+                    continue
+
+                pose = PoseStamped()
+                pose.header.frame_id = BASE_LINK
+                pose.pose.position.x = cx; pose.pose.position.y = cy; pose.pose.position.z = cz
+                pose.pose.orientation.w = 1.0
+                self.scene.add_box(name, pose, (sx, sy, sz))
+                params.extend([cx, cy, cz, sx, sy, sz])
+                ok = True
+                break
+            if not ok:
+                rospy.logwarn("Box placement retries exhausted; restarting episode box placement")
+                return False  # caller can retry the whole placement
+
+        rospy.sleep(0.5)  # ensure scene update
         self.box_params = np.array(params, dtype=np.float64)  # [18]
+        return True
 
     # -------- IK / FK --------
-    def compute_ik(self, target_pose: PoseStamped) -> Tuple[bool, np.ndarray]:
+    def compute_ik(self, target_pose: PoseStamped, seed: Optional[np.ndarray]) -> Tuple[bool, np.ndarray]:
         req = GetPositionIKRequest()
         req.ik_request.group_name = ARM_GROUP
         req.ik_request.pose_stamped = target_pose
         req.ik_request.ik_link_name = EEF_LINK
         req.ik_request.timeout = rospy.Duration(0.5)
-        req.ik_request.robot_state = self.robot.get_current_state()
+
+        if seed is not None and len(seed) == len(self.joint_names):
+            req.ik_request.robot_state = msg_robot_state_from_q(self.joint_names, seed)
+        else:
+            req.ik_request.robot_state = self.robot.get_current_state()
 
         try:
             res = self.ik_srv(req)
@@ -231,36 +253,39 @@ class PandaILDataGen:
         """
         Returns True if a rollout was added, else False.
         """
-        # 1) Randomize obstacles
-        self.randomize_three_boxes()
+        # 0) Remove old obstacles
+        self.remove_three_boxes()
 
-        # 2) Sample a valid start & goal via IK on random poses
-        for _ in range(MAX_GOAL_RETRIES):
-            start_pose = sample_pose_in_aabb()
-            sp = np.array([start_pose.pose.position.x, start_pose.pose.position.y, start_pose.pose.position.z])
-            if self.point_in_any_box(sp):
-                continue
-            ok, q_start = self.compute_ik(start_pose)  # seed=None -> current state
-            if ok and self.is_state_valid(q_start):
-                break
-        else:
-            rospy.logwarn("Failed to find valid start pose")
+        # 1) Set q_start to be the current joint states
+        q_start = np.array(self.group.get_current_joint_values(), dtype=np.float64)
+        start_pose = self.group.get_current_pose(end_effector_link=EEF_LINK)
+
+        if not self.is_state_valid(q_start):
+            rospy.logwarn("Current start state invalid in scene; aborting episode")
             return False
 
-        # 3) Sample a valid goal sufficiently far and not inside any box.
+        # 2) Sample a valid goal sufficiently far and not inside any box.
         for _ in range(MAX_GOAL_RETRIES):
             goal_pose = sample_pose_in_aabb()
-            gp = np.array([goal_pose.pose.position.x, goal_pose.pose.position.y, goal_pose.pose.position.z])
-            if self.point_in_any_box(gp):
-                continue
+            # gp = np.array([goal_pose.pose.position.x, goal_pose.pose.position.y, goal_pose.pose.position.z])
+            # if self.point_in_any_box(gp):
+            #     continue
             if pose_distance(start_pose, goal_pose) < MIN_EE_DIST:
                 continue
             # Seed goal IK with q_start for smoother, more solvable targets
-            ok, q_goal = self.compute_ik(goal_pose)
-            if ok and self.is_state_valid(q_goal):
+            ok, q_goal = self.compute_ik(goal_pose, seed=q_start)
+            if ok:
                 break
         else:
             rospy.logwarn("Failed to find valid goal pose")
+            return False
+        
+        # 3) Randomize boxes
+        start_point = np.array([start_pose.pose.position.x, start_pose.pose.position.y, start_pose.pose.position.z])
+        goal_point = np.array([goal_pose.pose.position.x, goal_pose.pose.position.y, goal_pose.pose.position.z])
+        ok = self.randomize_three_boxes_avoiding(forbid_points=[start_point, goal_point])
+        if not ok:
+            rospy.logwarn("Failed to randomize boxes to valid positions")
             return False
 
         # 3) Plan expert trajectory
@@ -271,6 +296,10 @@ class PandaILDataGen:
         
         # traj_dur = plan.joint_trajectory.points[-1].time_from_start.to_sec()
         # rospy.sleep(traj_dur + 1)
+        ok = self.group.execute(plan, wait=True)
+        if not ok:
+            rospy.logwarn("Failed to execute plan")
+            return False
 
         ##### Sanity check
         jt = plan.joint_trajectory
@@ -281,6 +310,8 @@ class PandaILDataGen:
 
         # FK of the intended goal joint state (your "canonical" target)
         goal_pos, goal_quat = self.fk_for_q(q_goal)
+
+        rospy.loginfo(f"start_pos={start_point} goal_pos={goal_pos} final_pos={final_pos}")
 
         # Position error (meters)
         pos_err = np.linalg.norm(final_pos - goal_pos)
@@ -380,21 +411,9 @@ class PandaILDataGen:
         rospy.loginfo(f"Saved dataset to {self.out_npz} and stats to {self.out_stats}")
 
     # -------- Validity helpers --------
-    def point_in_any_box(self, p_xyz: np.ndarray) -> bool:
-        """
-        Checks if a point p_xyz [3] lies inside any of the 3 boxes defined in self.box_params
-        which stores [cx,cy,cz, sx,sy,sz]*3 where s* are full edge lengths.
-        """
-        if self.box_params is None:
-            return False
-        bp = self.box_params.reshape(3, 6)
-        for (cx, cy, cz, sx, sy, sz) in bp:
-            hx, hy, hz = sx * 0.5, sy * 0.5, sz * 0.5
-            if (abs(p_xyz[0] - cx) <= hx and
-                abs(p_xyz[1] - cy) <= hy and
-                abs(p_xyz[2] - cz) <= hz):
-                return True
-        return False
+    def point_in_candidate_box(self, p, cx, cy, cz, sx, sy, sz, m):
+        hx, hy, hz = sx * 0.5 + m, sy * 0.5 + m, sz * 0.5 + m
+        return (abs(p[0] - cx) <= hx and abs(p[1] - cy) <= hy and abs(p[2] - cz) <= hz)
 
     def is_state_valid(self, q: np.ndarray) -> bool:
         req = GetStateValidityRequest()
@@ -460,7 +479,7 @@ def main():
             rospy.logwarn("Skipping episode")
             pass
 
-        time.sleep(2)
+        time.sleep(10)
 
     gen.save_dataset()
     rospy.loginfo("Done.")
