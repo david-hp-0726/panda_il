@@ -29,7 +29,7 @@ from sensor_msgs.msg import JointState
 from helpers import (
     rnd, quat_to_np, quat_conjugate, quat_multiply, quat_error,
     pose_distance, ensure_dir, msg_robot_state_from_q,
-    resample_trajectory, finite_diff
+    resample_trajectory, finite_diff, point_in_candidate_box, sample_pose_in_aabb
 )
 
 
@@ -44,26 +44,11 @@ MIN_EE_DIST = 0.01   # m
 BASE_LINK = "panda_link0"
 EEF_LINK = "panda_link8"
 ARM_GROUP = "panda_arm"
+MAX_SCALING_FACTOR = 0.6
 
 # Goal & obstacle sampling workspace (meters)
 WS_AABB = dict(x=(0.2, 0.7), y=(-0.4, 0.4), z=(0.0, 0.6))
 BOX_EDGE_RANGE = (0.04, 0.12)
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def sample_pose_in_aabb() -> PoseStamped:
-    pose = PoseStamped()
-    pose.header.frame_id = BASE_LINK
-    pose.pose.position.x = rnd(*WS_AABB["x"])
-    pose.pose.position.y = rnd(*WS_AABB["y"])
-    pose.pose.position.z = rnd(*WS_AABB["z"])
-    # orientation: identity (EE pointing down for Panda default)
-    pose.pose.orientation.x = 0.0
-    pose.pose.orientation.y = 0.0
-    pose.pose.orientation.z = 0.0
-    pose.pose.orientation.w = 1.0
-    return pose
 
 # -----------------------------
 # Core generator class
@@ -79,8 +64,8 @@ class PandaILDataGen:
         self.scene = PlanningSceneInterface(synchronous=True)
 
         self.group.set_planning_time(PLANNING_TIME)
-        self.group.set_max_velocity_scaling_factor(0.6)
-        self.group.set_max_acceleration_scaling_factor(0.6)
+        self.group.set_max_velocity_scaling_factor(MAX_SCALING_FACTOR)
+        self.group.set_max_acceleration_scaling_factor(MAX_SCALING_FACTOR)
 
         self.joint_names = self.group.get_active_joints()  # 7 Panda joints
         if len(self.joint_names) < 7:
@@ -146,7 +131,7 @@ class PandaILDataGen:
                 sx = rnd(*BOX_EDGE_RANGE); sy = rnd(*BOX_EDGE_RANGE); sz = rnd(*BOX_EDGE_RANGE)
 
                 # reject if any forbid point would be inside this candidate box
-                if any(self.point_in_candidate_box(p, cx, cy, cz, sx, sy, sz, margin) for p in forbid_points):
+                if any(point_in_candidate_box(p, cx, cy, cz, sx, sy, sz, margin) for p in forbid_points):
                     continue
 
                 pose = PoseStamped()
@@ -365,7 +350,7 @@ class PandaILDataGen:
 
         # Observation = [q, qdot, ee_pos_err(3) + q_err(4), obstacles(18)] = 39 dims
         obs = np.concatenate([Qaligned, qdot, ee_pos_err, q_err, obb], axis=1)
-
+        rospy.logwarn_once(f"Qaligned: {Qaligned.shape}, qdot: {qdot.shape}, ee_pos_err: {ee_pos_err.shape}, q_err: {q_err.shape}, obb: {obb.shape}")
         # dones & episode_starts
         T = obs.shape[0]
         dones = np.zeros((T,), dtype=np.bool_)
@@ -411,10 +396,6 @@ class PandaILDataGen:
         rospy.loginfo(f"Saved dataset to {self.out_npz} and stats to {self.out_stats}")
 
     # -------- Validity helpers --------
-    def point_in_candidate_box(self, p, cx, cy, cz, sx, sy, sz, m):
-        hx, hy, hz = sx * 0.5 + m, sy * 0.5 + m, sz * 0.5 + m
-        return (abs(p[0] - cx) <= hx and abs(p[1] - cy) <= hy and abs(p[2] - cz) <= hz)
-
     def is_state_valid(self, q: np.ndarray) -> bool:
         req = GetStateValidityRequest()
         req.group_name = ARM_GROUP
@@ -478,8 +459,6 @@ def main():
             # soft retry; adjust workspace/obstacles if too many fails
             rospy.logwarn("Skipping episode")
             pass
-
-        time.sleep(10)
 
     gen.save_dataset()
     rospy.loginfo("Done.")

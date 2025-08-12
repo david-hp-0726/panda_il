@@ -8,11 +8,19 @@ from typing import List, Tuple
 import numpy as np
 from moveit_msgs.msg import RobotState
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import PoseStamped
 
+
+WS_AABB = dict(x=(0.2, 0.7), y=(-0.4, 0.4), z=(0.0, 0.6))
+BASE_LINK = "panda_link0"
 
 # -----------------------------
 # Helpers (as-is)
 # -----------------------------
+def point_in_candidate_box(p, cx, cy, cz, sx, sy, sz, m):
+    hx, hy, hz = sx * 0.5 + m, sy * 0.5 + m, sz * 0.5 + m
+    return (abs(p[0] - cx) <= hx and abs(p[1] - cy) <= hy and abs(p[2] - cz) <= hz)
+
 def rnd(a, b):
     return a + np.random.rand() * (b - a)
 
@@ -93,3 +101,25 @@ def resample_trajectory(times: List[float], Q: np.ndarray, dt: float) -> Tuple[n
 def finite_diff(Q: np.ndarray, dt: float) -> np.ndarray:
     dq = (Q[1:] - Q[:-1]) / dt
     return dq
+
+def finite_diff_uniform(Qu: np.ndarray, dt: float) -> np.ndarray:
+    # Centered difference interior, forward/backward edges
+    dq = np.zeros_like(Qu)
+    dq[1:-1] = (Qu[2:] - Qu[:-2]) / (2.0*dt)
+    dq[0]    = (Qu[1]  - Qu[0])   / dt
+    dq[-1]   = (Qu[-1] - Qu[-2])  / dt
+    return dq
+
+def sample_pose_in_aabb() -> PoseStamped:
+    pose = PoseStamped()
+    pose.header.frame_id = BASE_LINK
+    pose.pose.position.x = rnd(*WS_AABB["x"])
+    pose.pose.position.y = rnd(*WS_AABB["y"])
+    pose.pose.position.z = rnd(*WS_AABB["z"])
+    # orientation: identity (EE pointing down for Panda default)
+    pose.pose.orientation.x = 0.0
+    pose.pose.orientation.y = 0.0
+    pose.pose.orientation.z = 0.0
+    pose.pose.orientation.w = 1.0
+    return pose
+
