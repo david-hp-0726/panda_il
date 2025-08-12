@@ -29,7 +29,8 @@ ARM_GROUP  = "panda_arm"
 EEF_LINK   = "panda_link8"
 BASE_LINK  = "panda_link0"
 WS_AABB    = dict(x=(0.2, 0.7), y=(-0.4, 0.4), z=(0.0, 0.6))
-BOX_EDGE_RANGE = (0.04, 0.12)
+# BOX_EDGE_RANGE = (0.04, 0.12)
+BOX_EDGE_RANGE = (0.001, 0.001)
 PLANNING_TIME = 2.0
 MAX_GOAL_RETRIES = 16
 MIN_EE_DIST = 0.01     # m
@@ -91,6 +92,8 @@ class BCController:
         self.model.eval()
 
         self.box_params = None
+
+        self.safe_q_default = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785] 
 
     # ---- IK/FK/validity ----
     def compute_ik(self, goal_pose: PoseStamped, seed: Optional[np.ndarray]) -> Tuple[bool, Optional[np.ndarray]]:
@@ -161,9 +164,35 @@ class BCController:
         a_scaled = self.model(x.unsqueeze(0)).squeeze(0)                          # [-1,1]
         dq = (a_scaled * self.a_scale.to(self.device)).cpu().numpy()              # unscale Δq
         return dq
+    
+    def reset_panda(self):
+        g = self.group
+        g.stop(); g.clear_pose_targets(); g.set_start_state_to_current_state()
+        # 1) Try a named target if available
+        for name in ("ready", "home"):
+            try:
+                if name in g.get_named_targets():
+                    g.set_named_target(name)
+                    if g.go(wait=True): 
+                        g.stop(); g.clear_pose_targets(); return True
+            except Exception:
+                pass
+        # 2) Fallback to a known-good joint vector
+        try:
+            g.set_joint_value_target(self.safe_q_default)
+            ok = g.go(wait=True)
+            g.stop(); g.clear_pose_targets()
+            return bool(ok)
+        except Exception:
+            return False
 
     # ---- rollout once ----
     def rollout_once(self) -> bool:
+        # reset to a valid pose
+        if not self.reset_panda():
+            rospy.logwarn("Reset failed")
+            return False
+
         # start
         q = np.array(self.group.get_current_joint_values(), dtype=np.float64)
         if not self.is_state_valid(q):
@@ -180,6 +209,9 @@ class BCController:
         else:
             rospy.logwarn("IK failed"); return False
         gpos, gquat = self.fk_for_q(q_goal)
+
+        # Sanity check
+        rospy.loginfo(f"start_pos: {start_p}, goal_pos: {gpos}")
 
         # boxes after goal; avoid endpoints
         for _ in range(5):
@@ -228,6 +260,7 @@ class BCController:
                 rospy.loginfo(f"[SUCCESS] steps={step+1} pos_err={pos_err:.4f}m ang_err={ang_err:.3f}rad")
                 return True
 
+            rospy.loginfo(f"Successfully moved to {p_now}, pos_err = {pos_err}")
             # optional pacing; planning dominates anyway
             time.sleep(0.0)
 
