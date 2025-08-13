@@ -63,3 +63,25 @@ $$
 - **Hidden layers**: 2 fully connected layers, each with 256 units and ReLU activation  
 - **Output**: $\hat{a}_t \in [-1,1]^7$ (Tanh activation), representing scaled $\Delta q_t$  
 
+## Limitations and Failure Modes
+
+At test time, the BC agent is queried for an incremental joint change $\Delta q_t$ given observation $o_t$. The new joint target is computed as $q_{t+1} = q_t + \Delta q_t$, and MoveIt is tasked with planning and executing a motion toward this target. This process repeats until the end-effector is expected to reach the final goal.
+
+Despite being trained on 1000 expert rollouts, the agent suffers from **covariate shift**: during training, it only sees states drawn from the expert’s distribution, but at test time, prediction errors cause it to enter states outside of that distribution. In these unseen states, the policy’s predictions degrade, leading to compounding errors that push it further off-course. For example, in one test run
+- [INFO] start_pos: [0.3069, 0.0000, 0.5903], goal_pos: [0.4212, 0.3824, 0.4835]
+- [INFO] pos_err = 0.4129
+- [INFO] pos_err = 0.4082
+...
+- [INFO] pos_err = 0.1185
+- [INFO] pos_err = 0.0848
+- [INFO] pos_err = 0.0977
+- [INFO] pos_err = 0.2489
+- [INFO] pos_err = 0.3740
+- [INFO] pos_err = 0.4379
+
+At first, the error decreases steadily from about $0.41$ m to $0.08$ m. However, once the policy drifts from the expert’s nominal path, the error begins to grow again, eventually moving the arm far from the goal despite MoveIt executing each sub-goal without collision. This problem could have been mitigated by using **DAgger**, which query's the expert as the agent moves around in the real environment, allowing the agent to correct it's error distribution.
+
+Another issue is **joint-limit violations**. The BC policy does not enforce that $q_t + \Delta q_t$ stays within joint bounds. When a predicted target exceeds limits, MoveIt raises an exception. This could be addressed via **action clipping** — at inference time, clamp $q_t + \Delta q_t$ to within joint bounds before passing it to MoveIt.
+
+
+
